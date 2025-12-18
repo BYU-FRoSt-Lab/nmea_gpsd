@@ -44,7 +44,7 @@ class NmeaToGpsd(Node):
     def _setup_server(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind(('0.0.0.0', self.gpsd_port))
+        self.server.bind((self.gpsd_host, self.gpsd_port))
         self.server.listen(1)
 
         self.get_logger().info(
