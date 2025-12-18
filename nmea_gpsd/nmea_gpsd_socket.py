@@ -12,7 +12,7 @@ from nmea_msgs.msg import Sentence
 class NmeaToGpsd(Node):
     def __init__(self):
         super().__init__('nmea_to_gpsd')
-
+        self.conn = None
         # Parameters
         self.declare_parameter('gpsd_host', '127.0.0.1')
         self.declare_parameter('gpsd_port', 3001)
