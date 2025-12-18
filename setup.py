@@ -20,7 +20,8 @@ setup(
  tests_require=['pytest'],
  entry_points={
      'console_scripts': [
-             'nmea_gpsd_socket = nmea_gpsd.nmea_gpsd_socket:main'
+             'nmea_gpsd_socket = nmea_gpsd.nmea_gpsd_socket:main',
+             'nmea_gpsd_udp = nmea_gpsd.nmea_gpsd_udp:main'
      ],
    },
 )
