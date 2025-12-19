@@ -35,7 +35,7 @@ class NmeaToGpsd(Node):
             f'to gpsd via UDP at {self.gpsd_host}:{self.gpsd_port}'
         )
 
-    def gprmc_from_gga(self, gga_sentence, timestamp):
+    def gprmc_from_gga(self, gga_sentence):
         """
         Generate minimal GPRMC sentence using GGA lat/lon and ROS2 UTC timestamp.
         This ensures the UTC time in GPRMC exactly matches the original GGA fix.
@@ -55,9 +55,10 @@ class NmeaToGpsd(Node):
         status = 'A' if fix_quality > 0 else 'V'
 
         # Extract UTC time and date from ROS2 timestamp
-        t = datetime.fromtimestamp(timestamp.sec + timestamp.nanosec * 1e-9, tz=timezone.utc)
-        utc_time_str = t.strftime('%H%M%S.%f')[:9]  # hhmmss.ss
-        utc_date_str = t.strftime('%d%m%y')         # DDMMYY
+        # t = datetime.fromtimestamp(timestamp.sec + timestamp.nanosec * 1e-9, tz=timezone.utc)
+        # utc_time_str = t.strftime('%H%M%S.%f')[:9]  # hhmmss.ss
+        # utc_date_str = t.strftime('%d%m%y')         # DDMMYY
+        utc_time_str = fields[1]  # Use time from GGA
 
         # Construct GPRMC core
         gprmc_core = f"GPRMC,{utc_time_str},{status},{lat},{lat_dir},{lon},{lon_dir},0.0,0.0,{utc_date_str},,,A"
@@ -78,7 +79,7 @@ class NmeaToGpsd(Node):
         self.send_sentence(sentence)
 
         # Construct GPRMC using ROS2 timestamp
-        GPRMC_sentence = self.gprmc_from_gga(sentence, msg.header.stamp)
+        GPRMC_sentence = self.gprmc_from_gga(sentence)
         if GPRMC_sentence:
             self.send_sentence(GPRMC_sentence)
 
