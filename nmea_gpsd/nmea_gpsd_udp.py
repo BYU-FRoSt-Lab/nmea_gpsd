@@ -57,7 +57,7 @@ class NmeaToGpsd(Node):
         utc_time_str = t.strftime('%H%M%S.%f')[:9]  # hhmmss.ss
         utc_date_str = t.strftime('%d%m%y')         # DDMMYY
 
-        gprmc_core = f"GPRMC,{utc_time_str},{status},{lat},{lat_dir},{lon},{lon_dir},0.0,0.0,{utc_date_str},,,A"
+        gprmc_core = f"GPRMC,{utc_time_str},,,,,,,,{utc_date_str},,,A"
 
         # Compute checksum
         checksum = 0
