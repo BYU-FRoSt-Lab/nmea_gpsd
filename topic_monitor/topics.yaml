@@ -1,0 +1,41 @@
+# List the name of the topic with the corresponding topic type
+# Ex.   - name: /topic
+#       - type: topic/type
+
+# Below is a list of all of the topic types accepted up to this point.
+#   - nav_msgs/msg/Odometry
+#   - sensor_msgs/msg/Image
+#   - sensor_msgs/msg/Imu
+#   - sensor_msgs/msg/NavSatFix
+#   - sensor_msgs/msg/PointCloud2
+
+# Notes:
+#   Time sync status is referenced to the first topic received by the callback function.
+topics:
+  # Inertial Sense IMU/GPS
+  - name: /inertial_sense/gps1/NavSatFix
+    type: sensor_msgs/msg/NavSatFix
+
+  # Ouster LiDARs
+  - name: /ouster_top/points
+    type: sensor_msgs/msg/PointCloud2
+
+  - name: /ouster_left/points
+    type: sensor_msgs/msg/PointCloud2
+
+  - name: /ouster_right/points
+    type: sensor_msgs/msg/PointCloud2
+
+  - name: /ouster_front/points
+    type: sensor_msgs/msg/PointCloud2
+
+  - name: /ouster_back/points
+    type: sensor_msgs/msg/PointCloud2
+  
+  # # Cameras
+  # - name: /camera/image_raw
+  #   type: sensor_msgs/msg/Image
+
+  # Emlid RTK GPS
+  - name: /emlid/NavSatFix
+    type: sensor_msgs/msg/NavSatFix
