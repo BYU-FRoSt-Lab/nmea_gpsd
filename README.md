@@ -56,6 +56,22 @@ You can also call it from the built-in `rqt_service_caller` GUI plugin.
 * **`stale_timeout_seconds`** (double, default: `2.0`): If no new message has arrived within this many wall-clock seconds, the topic is reported as `STALE`.
 * **`publish_period_seconds`** (double, default: `1.0`): How often the `DiagnosticArray` is published on `/diagnostics`.
 * **`diagnostic_name_prefix`** (string, default: `timesync`): Prefix on each `DiagnosticStatus.name`, used by the aggregator's `GenericAnalyzer` to group the statuses.
+* **`default_sample_every_n`** (int, default: `1`): Default subsampling for the timestamp check (see below). `1` deserializes every message.
+
+### Subsampling (`sample_every_n`)
+
+To read a topic's header timestamp the node must deserialize the message. For small messages that's negligible, but deserializing a full `PointCloud2` or `Image` on every message just to read an 8-byte stamp is wasteful. Set `sample_every_n` (globally via `default_sample_every_n`, or per-topic in the topics file) to deserialize the header only every Nth message.
+
+Message **counting, rate, and staleness are unaffected** — they don't require deserialization and are always computed from every message. Only the sync-offset comparison uses the sampled timestamp, so a topic publishing at 10 Hz with `sample_every_n: 10` still refreshes its offset roughly once per second. The first message after startup is always sampled so an initial reading appears promptly.
+
+```yaml
+topics:
+  - name: /bluerov2/sonar/points
+    type: sensor_msgs/msg/PointCloud2
+    sample_every_n: 10
+    qos:
+      reliability: best_effort
+```
 
 ### QoS Configuration
 

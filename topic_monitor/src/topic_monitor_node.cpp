@@ -69,6 +69,7 @@ struct TopicInfo
     rclcpp::Time first_received_walltime;  // when the first message arrived
     rclcpp::Time last_received_walltime;   // when the most recent message arrived
     bool received_message_since_start = false;
+    int sample_every_n = 1;  // Deserialize the header only every Nth message (1 = every message)
     std::shared_ptr<rclcpp::GenericSubscription> subscription;
     QoSConfig qos_config;  // Store QoS config for debugging and future features
 
@@ -105,6 +106,12 @@ class TopicMonitor : public rclcpp::Node
         // Prefix prepended to each DiagnosticStatus.name so an aggregator can group them.
         this->declare_parameter<std::string>("diagnostic_name_prefix", "timesync");
         diagnostic_name_prefix_ = this->get_parameter("diagnostic_name_prefix").as_string();
+        // Default subsampling: deserialize the header only every Nth message. 1 = every
+        // message. Raise this (or set per-topic in the topics file) for large/high-rate
+        // messages (e.g. PointCloud2/Image) to cut deserialization cost. Counting, rate,
+        // and staleness stay exact regardless; only the sync-offset stamp is sampled.
+        this->declare_parameter<int>("default_sample_every_n", 1);
+        default_sample_every_n_ = std::max(1, static_cast<int>(this->get_parameter("default_sample_every_n").as_int()));
 
         load_topics_from_file();
 
@@ -244,11 +251,29 @@ class TopicMonitor : public rclcpp::Node
                             }
                         }
 
-                        RCLCPP_INFO(this->get_logger(), 
-                                    "Subscribing to topic: %s with type: %s (QoS: depth=%zu, reliability=%s, durability=%s)", 
+                        // Optional per-topic subsampling override.
+                        int sample_every_n = default_sample_every_n_;
+                        if (topic_node["sample_every_n"])
+                        {
+                            int v = topic_node["sample_every_n"].as<int>();
+                            if (v >= 1)
+                            {
+                                sample_every_n = v;
+                            }
+                            else
+                            {
+                                RCLCPP_WARN(this->get_logger(),
+                                            "Invalid sample_every_n=%d for topic '%s'. Must be >= 1. Using %d.",
+                                            v, topic_name.c_str(), sample_every_n);
+                            }
+                        }
+
+                        RCLCPP_INFO(this->get_logger(),
+                                    "Subscribing to topic: %s with type: %s (QoS: depth=%zu, reliability=%s, durability=%s, sample_every_n=%d)",
                                     topic_name.c_str(), message_type.c_str(),
-                                    qos_config.history_depth, qos_config.reliability.c_str(), qos_config.durability.c_str());
-                        subscribe_to_topic(topic_name, message_type, qos_config);
+                                    qos_config.history_depth, qos_config.reliability.c_str(), qos_config.durability.c_str(),
+                                    sample_every_n);
+                        subscribe_to_topic(topic_name, message_type, qos_config, sample_every_n);
                     }
                     else
                     {
@@ -286,13 +311,14 @@ class TopicMonitor : public rclcpp::Node
     }
 
 
-    void subscribe_to_topic(const std::string &topic_name, const std::string &message_type, const QoSConfig &qos_config)
+    void subscribe_to_topic(const std::string &topic_name, const std::string &message_type, const QoSConfig &qos_config, int sample_every_n)
     {
         rclcpp::QoS qos_profile = create_qos_profile(qos_config);
 
         // Create a shared_ptr to TopicInfo on the heap
         std::shared_ptr<TopicInfo> current_info = std::make_shared<TopicInfo>(topic_name, message_type);
         current_info->qos_config = qos_config;
+        current_info->sample_every_n = sample_every_n;
 
         // Add the shared_ptr to the vector
         topic_infos_.push_back(current_info);
@@ -302,20 +328,34 @@ class TopicMonitor : public rclcpp::Node
         auto callback = [this, current_info](std::shared_ptr<rclcpp::SerializedMessage> msg)
         {
             rclcpp::Time now = this->now();
-            rclcpp::Time stamp;
-            bool have_stamp = extract_timestamp(msg, current_info->message_type, stamp);
 
-            std::lock_guard<std::mutex> lock(data_mutex_);
-            if (!current_info->received_message_since_start)
+            // Counting and freshness tracking are cheap and run on every message;
+            // the expensive deserialization to read the header stamp is throttled to
+            // every Nth message (plus the very first, to get an early reading).
+            bool do_sample;
             {
-                current_info->first_received_walltime = now;
+                std::lock_guard<std::mutex> lock(data_mutex_);
+                if (!current_info->received_message_since_start)
+                {
+                    current_info->first_received_walltime = now;
+                }
+                current_info->message_count++;
+                current_info->received_message_since_start = true;
+                current_info->last_received_walltime = now;
+
+                const int n = current_info->sample_every_n;
+                do_sample = (n <= 1) || (current_info->message_count == 1) || (current_info->message_count % n == 0);
             }
-            current_info->message_count++;
-            current_info->received_message_since_start = true;
-            current_info->last_received_walltime = now;
 
-            if (have_stamp)
+            if (!do_sample)
             {
+                return;  // skip deserialization entirely for this message
+            }
+
+            rclcpp::Time stamp;
+            if (extract_timestamp(msg, current_info->message_type, stamp))
+            {
+                std::lock_guard<std::mutex> lock(data_mutex_);
                 if (!current_info->last_timestamp.nanoseconds())  // first stamped message
                 {
                     current_info->first_timestamp = stamp;
@@ -596,6 +636,7 @@ class TopicMonitor : public rclcpp::Node
     double SYNC_THRESHOLD_ERROR_SECONDS;
     double STALE_TIMEOUT_SECONDS;
     std::string diagnostic_name_prefix_;
+    int default_sample_every_n_;
 
     std::mutex data_mutex_;
     std::vector<std::shared_ptr<TopicInfo>> topic_infos_;
