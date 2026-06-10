@@ -4,7 +4,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 
-// ADD THESE MISSING MESSAGE TYPE HEADERS
+// Known message types we can extract a header timestamp from
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/fluid_pressure.hpp>
 #include <sensor_msgs/msg/battery_state.hpp>
@@ -15,17 +15,22 @@
 #include <sensor_msgs/msg/magnetic_field.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
 
-// ADD THIS MISSING SERIALIZATION HEADER
 #include <rclcpp/serialization.hpp>
-// Sometimes these provide dependencies for serialization to be fully visible
-// #include <rclcpp/utilities.hpp> // Added in previous iteration, keep
 
+// Standard diagnostics + trigger interfaces
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <diagnostic_msgs/msg/key_value.hpp>
+#include <std_srvs/srv/trigger.hpp>
+
+#include <algorithm>
 #include <chrono>
 #include <exception> // Explicitly include for std::exception
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -36,10 +41,12 @@
 #include <rosidl_typesupport_cpp/identifier.hpp>
 #include <rosidl_typesupport_introspection_cpp/field_types.hpp>
 #include <rosidl_typesupport_introspection_cpp/message_introspection.hpp>
-// #include <rosidl_typesupport_introspection_cpp/traits.hpp> // Still commented out
 #include <rosidl_typesupport_introspection_cpp/visibility_control.h>
 
 using namespace std::chrono_literals;
+using DiagnosticArray = diagnostic_msgs::msg::DiagnosticArray;
+using DiagnosticStatus = diagnostic_msgs::msg::DiagnosticStatus;
+using KeyValue = diagnostic_msgs::msg::KeyValue;
 
 // Structure to hold QoS configuration
 struct QoSConfig
@@ -59,6 +66,8 @@ struct TopicInfo
     int message_count = 0;
     rclcpp::Time first_timestamp;
     rclcpp::Time last_timestamp;
+    rclcpp::Time first_received_walltime;  // when the first message arrived
+    rclcpp::Time last_received_walltime;   // when the most recent message arrived
     bool received_message_since_start = false;
     std::shared_ptr<rclcpp::GenericSubscription> subscription;
     QoSConfig qos_config;  // Store QoS config for debugging and future features
@@ -66,8 +75,7 @@ struct TopicInfo
     // Constructor to properly initialize all members and avoid warnings
     TopicInfo(std::string name, std::string type)
         : topic_name(std::move(name)), message_type(std::move(type)), message_count(0),
-          last_timestamp(),                                          // Default constructs to an invalid/zero timestamp
-          received_message_since_start(false), subscription(nullptr) // Initialize shared_ptr to nullptr
+          received_message_since_start(false), subscription(nullptr)
     {
     }
 };
@@ -88,32 +96,36 @@ class TopicMonitor : public rclcpp::Node
         SYNC_THRESHOLD_WARN_SECONDS = this->get_parameter("sync_threshold_warn_seconds").as_double();
         this->declare_parameter<double>("sync_threshold_error_seconds", 1.0);
         SYNC_THRESHOLD_ERROR_SECONDS = this->get_parameter("sync_threshold_error_seconds").as_double();
+        // How long without a new message before a topic is considered "stale".
+        this->declare_parameter<double>("stale_timeout_seconds", 2.0);
+        STALE_TIMEOUT_SECONDS = this->get_parameter("stale_timeout_seconds").as_double();
+        // How often the DiagnosticArray is published on /diagnostics.
+        this->declare_parameter<double>("publish_period_seconds", 1.0);
+        double publish_period = this->get_parameter("publish_period_seconds").as_double();
+        // Prefix prepended to each DiagnosticStatus.name so an aggregator can group them.
+        this->declare_parameter<std::string>("diagnostic_name_prefix", "timesync");
+        diagnostic_name_prefix_ = this->get_parameter("diagnostic_name_prefix").as_string();
 
         load_topics_from_file();
 
-        // Timer to stop listening and report results after 5 seconds
-        RCLCPP_INFO(this->get_logger(), "Starting 5 second timer to count messaged published from topics...");
-        monitoring_start_time_ = this->now();
-        timer_ = this->create_wall_timer(5s, std::bind(&TopicMonitor::report_and_shutdown, this));
+        // Continuously publish diagnostics on the conventional global /diagnostics
+        // topic (absolute name, so it ignores this node's namespace). This is what
+        // rqt_robot_monitor / diagnostic_aggregator consume.
+        diagnostics_pub_ = this->create_publisher<DiagnosticArray>("/diagnostics", 10);
+        diag_timer_ = this->create_wall_timer(
+            std::chrono::duration<double>(publish_period),
+            std::bind(&TopicMonitor::publish_diagnostics, this));
 
-        // Create an executor to process callbacks
-        executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
-        // executor_->add_node(shared_from_this());
+        // On-demand check: std_srvs/Trigger. Empty request; success = "all in sync".
+        trigger_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "check_time_sync",
+            std::bind(&TopicMonitor::handle_trigger, this, std::placeholders::_1, std::placeholders::_2));
 
-        // Spin in a separate thread to allow the main thread to continue and set up the timer
-        spin_thread_ = std::thread([this]() { executor_->spin(); });
+        RCLCPP_INFO(this->get_logger(),
+                    "topic_monitor running: publishing /diagnostics every %.2fs; call the 'check_time_sync' "
+                    "Trigger service for an on-demand pass/fail.",
+                    publish_period);
     }
-
-    ~TopicMonitor()
-    {
-        if (spin_thread_.joinable())
-        {
-            spin_thread_.join();
-        }
-    }
-
-    // New public method to start spinning the executor
-    void start_monitoring() { executor_->add_node(shared_from_this()); }
 
   private:
     // Helper function to create a QoS profile from configuration
@@ -289,13 +301,22 @@ class TopicMonitor : public rclcpp::Node
         // ensuring the TopicInfo object's lifetime is managed correctly.
         auto callback = [this, current_info](std::shared_ptr<rclcpp::SerializedMessage> msg)
         {
-            current_info->message_count++;                     // Use -> operator for shared_ptr
-            current_info->received_message_since_start = true; // Use -> operator
-
+            rclcpp::Time now = this->now();
             rclcpp::Time stamp;
-            if (extract_timestamp(msg, current_info->message_type, stamp)) // Use -> operator
+            bool have_stamp = extract_timestamp(msg, current_info->message_type, stamp);
+
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            if (!current_info->received_message_since_start)
             {
-                if (!current_info->last_timestamp.nanoseconds()) // First message received for this topic
+                current_info->first_received_walltime = now;
+            }
+            current_info->message_count++;
+            current_info->received_message_since_start = true;
+            current_info->last_received_walltime = now;
+
+            if (have_stamp)
+            {
+                if (!current_info->last_timestamp.nanoseconds())  // first stamped message
                 {
                     current_info->first_timestamp = stamp;
                 }
@@ -309,10 +330,6 @@ class TopicMonitor : public rclcpp::Node
 
     bool extract_timestamp(std::shared_ptr<rclcpp::SerializedMessage> msg, const std::string &message_type, rclcpp::Time &timestamp)
     {
-        std::string package_name = message_type.substr(0, message_type.find('/'));
-        std::string msg_name = message_type.substr(message_type.find_last_of('/') + 1);
-
-        // Workaround: We'll deserialize the message if it's one of the known types with a header.
         if (message_type == "sensor_msgs/msg/Imu")
         {
             sensor_msgs::msg::Imu imu_msg;
@@ -392,136 +409,211 @@ class TopicMonitor : public rclcpp::Node
         return false;
     }
 
-
-    void report_and_shutdown()
+    // Snapshot the live state into a DiagnosticArray. Also reports aggregate
+    // counts and a one-line summary via the out-parameters. Caller must NOT hold
+    // data_mutex_ (this method locks it).
+    DiagnosticArray build_diagnostics(int &num_warn, int &num_error, std::string &summary, std::string &reference_topic)
     {
-        timer_->cancel(); // Stop the timer
-        rclcpp::Time ref_time(0);
+        DiagnosticArray array;
+        array.header.stamp = this->now();
 
-        RCLCPP_INFO(this->get_logger(), "--------------------------------------");
-        RCLCPP_INFO(this->get_logger(), "---    Topic Monitoring Results    ---");
-        RCLCPP_INFO(this->get_logger(), "--------------------------------------\n");
+        rclcpp::Time now = this->now();
+        rclcpp::Time ref_time(0, 0, now.get_clock_type());
+        reference_topic.clear();
 
-        // A threshold for "synchronization" difference. This can be tuned. // TODO Parameterize this
-        // const double SYNC_THRESHOLD_WARN_SECONDS = 0.1;  // e.g., 100 milliseconds
-        // const double SYNC_THRESHOLD_ERROR_SECONDS = 1.0; // e.g., 100 milliseconds
-        int num_warn = 0;
-        int num_error = 0;
-        for (auto const &info_ptr : topic_infos_) // Iterate over shared_ptrs
+        std::lock_guard<std::mutex> lock(data_mutex_);
+
+        // Pick the reference topic: first in list that is fresh and stamped.
+        std::shared_ptr<TopicInfo> reference_info;
+        for (auto const &info : topic_infos_)
         {
-            // Use -> to access members of TopicInfo via the shared_ptr
-            if (info_ptr->message_count == 0)
+            if (info->message_count == 0 || info->last_timestamp.nanoseconds() == 0)
             {
-                RCLCPP_ERROR(this->get_logger(),
-                             "Topic: %s (Type: %s) - ERROR: No messages published!\n",
-                             info_ptr->topic_name.c_str(),
-                             info_ptr->message_type.c_str());
+                continue;
+            }
+            if ((now - info->last_received_walltime).seconds() <= STALE_TIMEOUT_SECONDS)
+            {
+                reference_info = info;
+                ref_time = info->last_timestamp;
+                reference_topic = info->topic_name;
+                break;
+            }
+        }
+
+        num_warn = 0;
+        num_error = 0;
+
+        for (auto const &info : topic_infos_)
+        {
+            DiagnosticStatus status;
+            status.name = diagnostic_name_prefix_ + ": " + info->topic_name;
+            status.hardware_id = info->message_type;
+
+            bool has_timestamp = (info->last_timestamp.nanoseconds() != 0);
+            bool is_reference = (info == reference_info);
+
+            double age = -1.0;
+            double rate = 0.0;
+            if (info->message_count > 0)
+            {
+                age = (now - info->last_received_walltime).seconds();
+                double span = (info->last_received_walltime - info->first_received_walltime).seconds();
+                rate = (span > 0.0 && info->message_count > 1) ? (info->message_count - 1) / span : 0.0;
+            }
+            double time_diff = 0.0;
+
+            if (info->message_count == 0)
+            {
+                status.level = DiagnosticStatus::STALE;
+                status.message = "No messages received since startup";
                 num_error++;
+            }
+            else if (age > STALE_TIMEOUT_SECONDS)
+            {
+                status.level = DiagnosticStatus::STALE;
+                status.message = "No message for " + fmt(age) + "s (stale threshold " + fmt(STALE_TIMEOUT_SECONDS) + "s)";
+                num_error++;
+            }
+            else if (!has_timestamp)
+            {
+                status.level = DiagnosticStatus::ERROR;
+                status.message = "Receiving, but no header timestamp could be extracted";
+                num_error++;
+            }
+            else if (!reference_info)
+            {
+                status.level = DiagnosticStatus::OK;
+                status.message = "Receiving (no reference topic available for comparison)";
+            }
+            else if (is_reference)
+            {
+                status.level = DiagnosticStatus::OK;
+                status.message = "Reference topic";
             }
             else
             {
-                RCLCPP_INFO(this->get_logger(),
-                            "Topic: %s (Type: %s) - Messages received: %d",
-                            info_ptr->topic_name.c_str(),
-                            info_ptr->message_type.c_str(),
-                            info_ptr->message_count);
-
-                if (info_ptr->last_timestamp.nanoseconds() != 0)
+                time_diff = std::abs((info->last_timestamp - ref_time).seconds());
+                if (time_diff > SYNC_THRESHOLD_ERROR_SECONDS)
                 {
-                    if (ref_time.nanoseconds() == 0) // First message with non zero timestamp
-                    {
-                        ref_time = info_ptr->last_timestamp;
-                        RCLCPP_INFO(this->get_logger(), "Topic: %s - Set as reference timestamp\n", info_ptr->topic_name.c_str());
-                    }
-                    else
-                    {
-                        double time_diff = std::abs((info_ptr->last_timestamp - ref_time).seconds());
-                        if (time_diff > SYNC_THRESHOLD_ERROR_SECONDS)
-                        {
-                            RCLCPP_ERROR(this->get_logger(),
-                                         "Topic: %s - Error: Timestamps out of sync. Latest message time (%.9f) is %.3f seconds from reference "
-                                         "topic time (%.9f). Expected within %.3f s.",
-                                         info_ptr->topic_name.c_str(),
-                                         info_ptr->last_timestamp.seconds(),
-                                         time_diff,
-                                         ref_time.seconds(),
-                                         SYNC_THRESHOLD_ERROR_SECONDS);
-                            num_error++;
-                        }
-                        else if (time_diff > SYNC_THRESHOLD_WARN_SECONDS)
-                        {
-                            RCLCPP_WARN(this->get_logger(),
-                                        "Topic: %s - WARNING: Timestamps potentially out of sync. Latest message time (%.9f) is \033[31m%.3f\033[33m "
-                                        "seconds from reference "
-                                        "topic time (%.9f). Expected within %.3f s. \033[31m(Possibly unsynchronized or very low frequency)\033[0m\n",
-                                        info_ptr->topic_name.c_str(),
-                                        info_ptr->last_timestamp.seconds(),
-                                        time_diff,
-                                        ref_time.seconds(),
-                                        SYNC_THRESHOLD_WARN_SECONDS);
-                            num_warn++;
-                        }
-                        else
-                        {
-                            RCLCPP_INFO(this->get_logger(),
-                                        "Topic: %s - Timestamps appear synchronized with end time difference \033[32m%.3f\033[0m s\n",
-                                        info_ptr->topic_name.c_str(),
-                                        time_diff);
-                        }
-                    }
+                    status.level = DiagnosticStatus::ERROR;
+                    status.message = "Out of sync by " + fmt(time_diff) + "s (> error threshold " + fmt(SYNC_THRESHOLD_ERROR_SECONDS) + "s)";
+                    num_error++;
+                }
+                else if (time_diff > SYNC_THRESHOLD_WARN_SECONDS)
+                {
+                    status.level = DiagnosticStatus::WARN;
+                    status.message = "Offset " + fmt(time_diff) + "s (> warn threshold " + fmt(SYNC_THRESHOLD_WARN_SECONDS) + "s)";
+                    num_warn++;
                 }
                 else
                 {
-                    RCLCPP_WARN(this->get_logger(),
-                                "Topic: %s - Could not check timestamp synchronization. No header found or first message not received properly.\n",
-                                info_ptr->topic_name.c_str());
-                    num_error++;
+                    status.level = DiagnosticStatus::OK;
+                    status.message = "Synchronized (offset " + fmt(time_diff) + "s)";
                 }
             }
+
+            status.values.push_back(make_kv("message type", info->message_type));
+            status.values.push_back(make_kv("message count", std::to_string(info->message_count)));
+            status.values.push_back(make_kv("rate (Hz)", fmt(rate, 2)));
+            status.values.push_back(make_kv("age (s)", age >= 0.0 ? fmt(age) : "n/a"));
+            status.values.push_back(make_kv("has timestamp", has_timestamp ? "true" : "false"));
+            status.values.push_back(make_kv("time diff (s)", has_timestamp ? fmt(time_diff) : "n/a"));
+            status.values.push_back(make_kv("is reference", is_reference ? "true" : "false"));
+
+            array.status.push_back(status);
         }
-        // \033[0m -> Reset
-        // \033[31m -> Red
-        // \033[32m -> Green
-        // \033[33m -> Yellow
-        RCLCPP_INFO(this->get_logger(),
-                    "Warnings: %s%d%s, Errors: %s%d%s",
-                    (num_warn > 0) ? "\033[33m" : "\033[32m",
-                    num_warn,
-                    "\033[0m", // if >0 then yellow else green
-                    (num_error > 0) ? "\033[31m" : "\033[32m",
-                    num_error,
-                    "\033[0m"); // if >0 then red else green
-        RCLCPP_INFO(this->get_logger(), "-------------------------------------");
-        RCLCPP_INFO(this->get_logger(), "---      Monitoring Complete      ---");
-        RCLCPP_INFO(this->get_logger(), "-------------------------------------");
-        rclcpp::shutdown();
+
+        summary = std::to_string(topic_infos_.size()) + " topics monitored, " + std::to_string(num_warn) +
+                  " warnings, " + std::to_string(num_error) + " errors" +
+                  (reference_topic.empty() ? "" : (" (ref: " + reference_topic + ")"));
+
+        return array;
     }
 
-    // Variables from parameters
+    // Timer callback: publish the current diagnostics snapshot.
+    void publish_diagnostics()
+    {
+        int num_warn = 0, num_error = 0;
+        std::string summary, reference_topic;
+        DiagnosticArray array = build_diagnostics(num_warn, num_error, summary, reference_topic);
+        diagnostics_pub_->publish(array);
+    }
+
+    // Trigger service: report an on-demand pass/fail with a human-readable summary.
+    void handle_trigger(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+    {
+        int num_warn = 0, num_error = 0;
+        std::string summary, reference_topic;
+        DiagnosticArray array = build_diagnostics(num_warn, num_error, summary, reference_topic);
+
+        // Publish immediately too, so any monitor reflects the freshly-checked state.
+        diagnostics_pub_->publish(array);
+
+        std::string detail = summary;
+        for (auto const &s : array.status)
+        {
+            detail += "\n  [" + level_name(s.level) + "] " + s.name + " - " + s.message;
+        }
+
+        response->success = (num_warn == 0 && num_error == 0);
+        response->message = detail;
+        RCLCPP_INFO(this->get_logger(), "check_time_sync: %s", summary.c_str());
+    }
+
+    static KeyValue make_kv(const std::string &key, const std::string &value)
+    {
+        KeyValue kv;
+        kv.key = key;
+        kv.value = value;
+        return kv;
+    }
+
+    static std::string level_name(unsigned char level)
+    {
+        switch (level)
+        {
+            case DiagnosticStatus::OK:    return "OK";
+            case DiagnosticStatus::WARN:  return "WARN";
+            case DiagnosticStatus::ERROR: return "ERROR";
+            case DiagnosticStatus::STALE: return "STALE";
+            default:                      return "UNKNOWN";
+        }
+    }
+
+    static std::string fmt(double seconds, int precision = 3)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.*f", precision, seconds);
+        return std::string(buf);
+    }
+
+    // Parameters
     std::string topics_file_;
     bool relative_path_;
     double SYNC_THRESHOLD_WARN_SECONDS;
     double SYNC_THRESHOLD_ERROR_SECONDS;
+    double STALE_TIMEOUT_SECONDS;
+    std::string diagnostic_name_prefix_;
 
+    std::mutex data_mutex_;
     std::vector<std::shared_ptr<TopicInfo>> topic_infos_;
-    rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::Time monitoring_start_time_;
-    std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
-    std::thread spin_thread_;
+    rclcpp::Publisher<DiagnosticArray>::SharedPtr diagnostics_pub_;
+    rclcpp::TimerBase::SharedPtr diag_timer_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_service_;
 };
 
 int main(int argc, char *argv[])
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<TopicMonitor>();
-    // The node will manage its own spinning via the MultiThreadedExecutor in a separate thread.
-    // main will just wait for ROS to shutdown, which is triggered by report_and_shutdown().
-    node->start_monitoring();
 
-    while (rclcpp::ok())
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Sleep briefly to avoid busy-waiting
-    }
+    // Multi-threaded so the service / timer can run while topic callbacks keep
+    // updating live state.
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
 
     rclcpp::shutdown();
     return 0;

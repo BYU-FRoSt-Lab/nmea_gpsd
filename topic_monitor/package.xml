@@ -11,8 +11,11 @@
 
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>diagnostic_msgs</depend>
   <depend>ament_index_cpp</depend>
   <depend>rosidl_runtime_cpp</depend>
   <depend>rosidl_typesupport_introspection_cpp</depend>

@@ -8,16 +8,15 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(rosidl_runtime_cpp REQUIRED)
 find_package(rosidl_typesupport_introspection_cpp REQUIRED)
 find_package(yaml-cpp REQUIRED)
-
-# ADD THIS: Explicitly find and link rclcpp_serialization
-# find_package(rclcpp_serialization REQUIRED)
-
 
 # Define the executable
 add_executable(topic_monitor_node src/topic_monitor_node.cpp)
@@ -26,8 +25,11 @@ add_executable(topic_monitor_node src/topic_monitor_node.cpp)
 ament_target_dependencies(topic_monitor_node
   rclcpp
   std_msgs
+  std_srvs
   sensor_msgs
   nav_msgs
+  geometry_msgs
+  diagnostic_msgs
   ament_index_cpp
   rosidl_runtime_cpp
   rosidl_typesupport_introspection_cpp
@@ -49,12 +51,14 @@ install(DIRECTORY config
 ament_export_dependencies(
   rclcpp
   std_msgs
+  std_srvs
   sensor_msgs
   nav_msgs
+  geometry_msgs
+  diagnostic_msgs
   ament_index_cpp
   rosidl_runtime_cpp
   rosidl_typesupport_introspection_cpp
-  rclcpp_serialization # ADD THIS
 )
 
 ament_package()

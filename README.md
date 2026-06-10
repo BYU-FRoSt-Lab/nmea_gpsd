@@ -1,15 +1,51 @@
 # time_sync_utils
 
-This repository contains utilities for handling and monitoring time-synchronized data in ROS 2. It consists of two main packages: `nmea_gpsd` for bridging GPS data and `topic_monitor` for validating message synchronization.
+This repository contains utilities for handling and monitoring time-synchronized data in ROS 2. It consists of two packages: `topic_monitor` for validating message synchronization (publishing standard `diagnostic_msgs` plus a Trigger service), and `nmea_gpsd` for bridging GPS data.
 
 
 ## 1. topic_monitor
 
-The `topic_monitor` package is a diagnostic tool used to verify that various ROS 2 topics are active and that their timestamps are synchronized within a specified threshold. It reads a list of target topics from a configuration file, monitors them for 5 seconds, and reports a summary of message counts and synchronization offsets.
+The `topic_monitor` package is a diagnostic tool used to verify that various ROS 2 topics are active and that their timestamps are synchronized within a specified threshold. It reads a list of target topics from a configuration file and **runs continuously**, maintaining live per-topic statistics (message count, approximate rate, age of the last message, and the latest header timestamp).
+
+It reports using **standard interfaces only** (no custom messages):
+
+* It continuously publishes a `diagnostic_msgs/DiagnosticArray` on the conventional global **`/diagnostics`** topic — one `DiagnosticStatus` per monitored topic.
+* It exposes a `std_srvs/Trigger` service for an on-demand pass/fail check.
 
 ### Nodes
 
-* **`topic_monitor_node`**: The primary C++ node that subscribes to topics and performs timing analysis.
+* **`topic_monitor_node`**: The primary C++ node that subscribes to topics and performs timing analysis. It is meant to be launched persistently (it is included in `sensor_bringup/bluerov_launch.py`).
+
+### Diagnostics (`/diagnostics`)
+
+Each monitored topic becomes one `DiagnosticStatus` named `timesync: <topic>`, with:
+
+* **`level`**: `OK` (0), `WARN` (1), `ERROR` (2), or `STALE` (3). `WARN`/`ERROR` come from the timestamp offset crossing the warn/error thresholds; `STALE` means no message (ever, or within `stale_timeout_seconds`); `ERROR` is also used when a header timestamp cannot be extracted.
+* **`message`**: human-readable explanation of the level.
+* **`hardware_id`**: the ROS message type.
+* **`values`**: `message count`, `rate (Hz)`, `age (s)`, `has timestamp`, `time diff (s)`, `is reference`.
+
+The reference topic is the first entry in the topics file that is currently receiving fresh, stamped messages; all other timestamps are compared against it.
+
+#### Viewing the status lights
+
+A `diagnostic_aggregator` is launched alongside the monitor (see `config/diagnostic_aggregator.yaml`) which republishes a grouped tree on **`/diagnostics_agg`**. Open the standard GUI:
+
+```bash
+ros2 run rqt_robot_monitor rqt_robot_monitor   # tree view of /diagnostics_agg (status lights)
+# or, for the raw un-aggregated feed:
+ros2 run rqt_runtime_monitor rqt_runtime_monitor   # reads /diagnostics directly
+```
+
+### Service (`check_time_sync`)
+
+* **`check_time_sync`** (`std_srvs/srv/Trigger`): Empty request. `success` is true only if every topic is `OK`; `message` contains a one-line summary followed by a per-topic breakdown. The service also publishes a fresh `/diagnostics` snapshot when called.
+
+```bash
+ros2 service call /bluerov2/check_time_sync std_srvs/srv/Trigger "{}"
+```
+
+You can also call it from the built-in `rqt_service_caller` GUI plugin.
 
 ### Parameters
 
@@ -17,6 +53,9 @@ The `topic_monitor` package is a diagnostic tool used to verify that various ROS
 * **`relative_path`** (bool, default: `true`): If true, the node looks for the `topics_file` relative to the package's share directory.
 * **`sync_threshold_warn_seconds`** (double, default: `0.1`): The time difference (in seconds) between a topic's timestamp and the reference topic that triggers a warning.
 * **`sync_threshold_error_seconds`** (double, default: `1.0`): The time difference that triggers an error.
+* **`stale_timeout_seconds`** (double, default: `2.0`): If no new message has arrived within this many wall-clock seconds, the topic is reported as `STALE`.
+* **`publish_period_seconds`** (double, default: `1.0`): How often the `DiagnosticArray` is published on `/diagnostics`.
+* **`diagnostic_name_prefix`** (string, default: `timesync`): Prefix on each `DiagnosticStatus.name`, used by the aggregator's `GenericAnalyzer` to group the statuses.
 
 ### QoS Configuration
 
